@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>としょかんクイズ - NDCタイムアタック</title>
+<title>図書館ジャンルクイズ</title>
 <style>
   html, body {
     margin: 0;
@@ -25,8 +25,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.70.0/phaser.min.js"></script>
 <script>
 /* =========================================================
-   としょかんクイズ - NDC(日本十進分類法)タイムアタック
-   数字キー0〜9とNDCジャンルを一致させて、10問を早く・正確に解く。
+   図書館ジャンルクイズ - NDC(日本十進分類法)タイムアタック
+   数字キー0〜9とNDCジャンルを一致させて、指定問題数を早く・正確に解く。
    ========================================================= */
 
 const WIDTH = 800;
@@ -46,7 +46,13 @@ const NDC_GENRES = [
   { key: 9, name: '文学' },
 ];
 
-const TOTAL_QUESTIONS = 10;
+// ---------- ゲーム全体の設定(スタート画面・設定画面から参照/変更される) ----------
+// questionCount: 出題数(5/10/15/20)。20問の場合は10ジャンルを2周してランダム順で出題。
+// showKeyNumbers: 右側のお題エリアにNDC番号のヒント数字を表示するか
+const gameSettings = {
+  questionCount: 10,
+  showKeyNumbers: true,
+};
 
 // ---------- 効果音(Web Audio APIで都度合成、外部ファイル不要) ----------
 class SoundFX {
@@ -112,25 +118,55 @@ class SoundFX {
 }
 const sfx = new SoundFX();
 
+// ---------- 出題順の生成 ----------
+// questionCountが10以下ならNDC10ジャンルからその数だけランダムに抽出(重複なし)。
+// 10を超える(15・20問)場合は、まず10ジャンルを1周させ、残りの問題数分をさらにランダム順で追加する
+// (同じジャンルが連続しないよう、2周目の先頭が1周目の最後と被らないように調整する)。
+function buildQuestionOrder(count) {
+  if (count <= NDC_GENRES.length) {
+    return Phaser.Utils.Array.Shuffle(NDC_GENRES.slice()).slice(0, count);
+  }
+  const order = [];
+  let remaining = count;
+  let prevLast = null;
+  while (remaining > 0) {
+    let lap = Phaser.Utils.Array.Shuffle(NDC_GENRES.slice());
+    if (prevLast !== null && lap[0].key === prevLast) {
+      // 前の周の最後と今回の先頭が被ったら入れ替えて連続を避ける
+      const swapIdx = 1 + Math.floor(Math.random() * (lap.length - 1));
+      [lap[0], lap[swapIdx]] = [lap[swapIdx], lap[0]];
+    }
+    const take = Math.min(remaining, lap.length);
+    order.push(...lap.slice(0, take));
+    prevLast = order[order.length - 1].key;
+    remaining -= take;
+  }
+  return order;
+}
+
 // ---------- 評価ランク計算 ----------
 // 正答数を最優先(基本ランクの上限を決める)、その範囲内でタイムを加味する。
 // 「遅くても全問正解ならある程度評価は良い／速くても不正解が多いと評価は下がる」を満たす設計。
-function calcRank(correctCount, missCount, elapsedSec) {
-  // 正答数ベースの基本評価と、そのランク内で出せる最高ランク
+// 問題数(total)が変わっても正答率ベースで判定するため、割合で基準を作る。
+function calcRank(correctCount, missCount, elapsedSec, total) {
+  const rate = correctCount / total;
+
+  // 正答率ベースの基本評価と、そのランク内で出せる最高ランク
   let baseRank;
-  if (correctCount === 10 && missCount === 0) baseRank = 'S';
-  else if (correctCount >= 9) baseRank = 'A';
-  else if (correctCount >= 7) baseRank = 'B';
-  else if (correctCount >= 5) baseRank = 'C';
+  if (rate === 1 && missCount === 0) baseRank = 'S';
+  else if (rate >= 0.9) baseRank = 'A';
+  else if (rate >= 0.7) baseRank = 'B';
+  else if (rate >= 0.5) baseRank = 'C';
   else baseRank = 'D';
 
-  // タイムによる補正順位（速いほど良いが、正答数の壁は超えられない）
+  // タイムによる補正順位（速いほど良いが、正答数の壁は超えられない）。問題数に応じて基準を比例させる。
   const rankOrder = ['D', 'C', 'B', 'A', 'S'];
+  const secPerQ = elapsedSec / total;
   let timeRank;
-  if (elapsedSec <= 20) timeRank = 'S';
-  else if (elapsedSec <= 35) timeRank = 'A';
-  else if (elapsedSec <= 55) timeRank = 'B';
-  else if (elapsedSec <= 80) timeRank = 'C';
+  if (secPerQ <= 2.0) timeRank = 'S';
+  else if (secPerQ <= 3.5) timeRank = 'A';
+  else if (secPerQ <= 5.5) timeRank = 'B';
+  else if (secPerQ <= 8.0) timeRank = 'C';
   else timeRank = 'D';
 
   const baseIdx = rankOrder.indexOf(baseRank);
@@ -138,7 +174,7 @@ function calcRank(correctCount, missCount, elapsedSec) {
   // 最終ランクは基本ランクを上限として、タイムランクとの min を取る
   const finalIdx = Math.min(baseIdx, timeIdx);
   // ただし全問正解(ノーミス)の場合だけは基本ランクSを保証しつつ、タイムが極端に遅い場合はAまで許容
-  if (correctCount === 10 && missCount === 0) {
+  if (rate === 1 && missCount === 0) {
     return finalIdx >= rankOrder.indexOf('A') ? rankOrder[finalIdx] : 'A';
   }
   return rankOrder[finalIdx];
@@ -151,6 +187,134 @@ const RANK_COMMENT = {
   C: 'まずまず。復習してみよう',
   D: 'NDCをもう一度確認しよう',
 };
+
+// ============================================================
+// タイトル(スタート)シーン
+// ============================================================
+class TitleScene extends Phaser.Scene {
+  constructor() {
+    super('TitleScene');
+  }
+
+  preload() {
+    this.load.image('bg', 'assets/library-bg.png');
+    this.load.image('character', 'assets/character.png');
+  }
+
+  create() {
+    this.add.image(WIDTH / 2, HEIGHT / 2, 'bg').setDisplaySize(WIDTH, HEIGHT);
+    this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.45);
+
+    this.add.image(150, 380, 'character').setScale(0.5);
+
+    this.add.text(WIDTH / 2 + 60, 110, '図書館ジャンルクイズ', {
+      fontSize: '46px', color: '#f2cc5b', fontFamily: 'sans-serif', fontStyle: 'bold', align: 'center',
+    }).setOrigin(0.5);
+
+    this.add.text(WIDTH / 2 + 60, 165, 'NDC(日本十進分類法)タイムアタック', {
+      fontSize: '18px', color: '#ffffff', fontFamily: 'sans-serif', align: 'center',
+    }).setOrigin(0.5);
+
+    const startBtn = this.makeButton(WIDTH / 2 + 60, 280, 'スタート', '#f2cc5b', '#1a140c');
+    startBtn.on('pointerdown', () => this.scene.start('MainScene'));
+
+    const settingsBtn = this.makeButton(WIDTH / 2 + 60, 350, '設定', '#5fa8d3', '#1a140c');
+    settingsBtn.on('pointerdown', () => this.scene.start('SettingsScene'));
+
+    // 現在の設定を小さく表示
+    this.add.text(WIDTH / 2 + 60, 420, `問題数: ${gameSettings.questionCount}問 / ヒント数字: ${gameSettings.showKeyNumbers ? '表示' : '非表示'}`, {
+      fontSize: '15px', color: '#cccccc', fontFamily: 'sans-serif',
+    }).setOrigin(0.5);
+
+    this.input.keyboard.once('keydown-ENTER', () => this.scene.start('MainScene'));
+  }
+
+  makeButton(x, y, label, bg, fg) {
+    return this.add.text(x, y, label, {
+      fontSize: '26px', color: fg, fontFamily: 'sans-serif', fontStyle: 'bold',
+      backgroundColor: bg, padding: { x: 36, y: 14 },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+  }
+}
+
+// ============================================================
+// 設定シーン(スタート画面からのみ遷移可能)
+// ============================================================
+class SettingsScene extends Phaser.Scene {
+  constructor() {
+    super('SettingsScene');
+  }
+
+  create() {
+    this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x1a140c, 1);
+
+    this.add.text(WIDTH / 2, 60, '設定', {
+      fontSize: '38px', color: '#f2cc5b', fontFamily: 'sans-serif', fontStyle: 'bold',
+    }).setOrigin(0.5);
+
+    // ---- 問題数選択 ----
+    this.add.text(WIDTH / 2, 140, '問題数', {
+      fontSize: '22px', color: '#ffffff', fontFamily: 'sans-serif',
+    }).setOrigin(0.5);
+
+    const counts = [5, 10, 15, 20];
+    this.countButtons = [];
+    const startX = WIDTH / 2 - (counts.length - 1) * 70;
+    counts.forEach((c, i) => {
+      const btn = this.add.text(startX + i * 140, 190, `${c}問`, {
+        fontSize: '22px', fontFamily: 'sans-serif', fontStyle: 'bold',
+        padding: { x: 18, y: 10 },
+      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+      btn.count = c;
+      btn.on('pointerdown', () => {
+        gameSettings.questionCount = c;
+        this.refreshButtons();
+      });
+      this.countButtons.push(btn);
+    });
+
+    // ---- ヒント数字 表示/非表示 ----
+    this.add.text(WIDTH / 2, 300, 'ジャンル横のNDC番号ヒント', {
+      fontSize: '22px', color: '#ffffff', fontFamily: 'sans-serif',
+    }).setOrigin(0.5);
+    this.add.text(WIDTH / 2, 330, '(右側のお題エリアに数字ヒントを出すかどうか)', {
+      fontSize: '14px', color: '#aaaaaa', fontFamily: 'sans-serif',
+    }).setOrigin(0.5);
+
+    const onBtn = this.add.text(WIDTH / 2 - 90, 380, '表示する', {
+      fontSize: '20px', fontFamily: 'sans-serif', fontStyle: 'bold', padding: { x: 18, y: 10 },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    const offBtn = this.add.text(WIDTH / 2 + 90, 380, '表示しない', {
+      fontSize: '20px', fontFamily: 'sans-serif', fontStyle: 'bold', padding: { x: 18, y: 10 },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    this.hintButtons = { on: onBtn, off: offBtn };
+    onBtn.on('pointerdown', () => { gameSettings.showKeyNumbers = true; this.refreshButtons(); });
+    offBtn.on('pointerdown', () => { gameSettings.showKeyNumbers = false; this.refreshButtons(); });
+
+    this.refreshButtons();
+
+    // ---- 戻るボタン(スタート画面へ) ----
+    const backBtn = this.add.text(WIDTH / 2, 500, 'スタート画面にもどる', {
+      fontSize: '20px', color: '#1a140c', fontFamily: 'sans-serif', fontStyle: 'bold',
+      backgroundColor: '#f2cc5b', padding: { x: 20, y: 12 },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    backBtn.on('pointerdown', () => this.scene.start('TitleScene'));
+    this.input.keyboard.once('keydown-ESC', () => this.scene.start('TitleScene'));
+  }
+
+  refreshButtons() {
+    this.countButtons.forEach(btn => {
+      const active = btn.count === gameSettings.questionCount;
+      btn.setColor(active ? '#1a140c' : '#ffffff');
+      btn.setBackgroundColor(active ? '#f2cc5b' : '#3a2a1c');
+    });
+    const { on, off } = this.hintButtons;
+    on.setColor(gameSettings.showKeyNumbers ? '#1a140c' : '#ffffff');
+    on.setBackgroundColor(gameSettings.showKeyNumbers ? '#5fd97a' : '#3a2a1c');
+    off.setColor(!gameSettings.showKeyNumbers ? '#1a140c' : '#ffffff');
+    off.setBackgroundColor(!gameSettings.showKeyNumbers ? '#5fd97a' : '#3a2a1c');
+  }
+}
 
 // ============================================================
 // メインシーン
@@ -180,16 +344,18 @@ class MainScene extends Phaser.Scene {
     this.charBaseX = 150;
     this.charBaseY = 350;
 
-    // ---- キー対応表を左下に小さく常時表示(覚え始めのヒント) ----
-    const guideLines = NDC_GENRES.map(g => `${g.key} : ${g.name}`);
-    this.add.text(20, 20, guideLines.slice(0, 5).join('\n'), {
-      fontSize: '15px', color: '#fff8e7', fontFamily: 'sans-serif', lineSpacing: 6,
-      backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 8, y: 6 },
-    });
-    this.add.text(130, 20, guideLines.slice(5, 10).join('\n'), {
-      fontSize: '15px', color: '#fff8e7', fontFamily: 'sans-serif', lineSpacing: 6,
-      backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 8, y: 6 },
-    });
+    // ---- キー対応表を左下に小さく常時表示(設定でON/OFF可能なヒント) ----
+    if (gameSettings.showKeyNumbers) {
+      const guideLines = NDC_GENRES.map(g => `${g.key} : ${g.name}`);
+      this.add.text(20, 20, guideLines.slice(0, 5).join('\n'), {
+        fontSize: '15px', color: '#fff8e7', fontFamily: 'sans-serif', lineSpacing: 6,
+        backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 8, y: 6 },
+      });
+      this.add.text(130, 20, guideLines.slice(5, 10).join('\n'), {
+        fontSize: '15px', color: '#fff8e7', fontFamily: 'sans-serif', lineSpacing: 6,
+        backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 8, y: 6 },
+      });
+    }
 
     // ---- お題エリア(右側) ----
     this.add.text(600, 90, 'このジャンルは\nNDCで何番？', {
@@ -220,7 +386,8 @@ class MainScene extends Phaser.Scene {
     this.flashOverlay = this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0xffffff, 0).setDepth(100);
 
     // ---- ゲーム状態 ----
-    this.order = Phaser.Utils.Array.Shuffle(NDC_GENRES.slice()); // 10ジャンルをランダム順で1回ずつ出題
+    this.totalQuestions = gameSettings.questionCount;
+    this.order = buildQuestionOrder(this.totalQuestions);
     this.qIndex = 0;
     this.correctCount = 0;
     this.missCount = 0;
@@ -244,13 +411,13 @@ class MainScene extends Phaser.Scene {
   }
 
   showQuestion() {
-    if (this.qIndex >= TOTAL_QUESTIONS) {
+    if (this.qIndex >= this.totalQuestions) {
       this.finishGame();
       return;
     }
     this.currentGenre = this.order[this.qIndex];
     this.questionText.setText(this.currentGenre.name);
-    this.progressText.setText(`第 ${this.qIndex + 1} / ${TOTAL_QUESTIONS} 問`);
+    this.progressText.setText(`第 ${this.qIndex + 1} / ${this.totalQuestions} 問`);
     this.answeredThisQ = false;
   }
 
@@ -333,6 +500,7 @@ class MainScene extends Phaser.Scene {
       correctCount: this.correctCount,
       missCount: this.missCount,
       elapsedSec: finalElapsed,
+      totalQuestions: this.totalQuestions,
     });
   }
 }
@@ -349,43 +517,50 @@ class ResultScene extends Phaser.Scene {
     this.correctCount = data.correctCount;
     this.missCount = data.missCount;
     this.elapsedSec = data.elapsedSec;
+    this.totalQuestions = data.totalQuestions;
   }
 
   create() {
     this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x1a140c, 1);
 
-    this.add.text(WIDTH / 2, 70, 'クリア！', {
-      fontSize: '44px', color: '#f2cc5b', fontFamily: 'sans-serif', fontStyle: 'bold',
+    this.add.text(WIDTH / 2, 60, 'クリア！', {
+      fontSize: '40px', color: '#f2cc5b', fontFamily: 'sans-serif', fontStyle: 'bold',
     }).setOrigin(0.5);
 
-    const rank = calcRank(this.correctCount, this.missCount, this.elapsedSec);
+    const rank = calcRank(this.correctCount, this.missCount, this.elapsedSec, this.totalQuestions);
     const rankColors = { S: '#ffd23f', A: '#5fd97a', B: '#5fa8d3', C: '#f4a261', D: '#ff6b6b' };
 
-    this.add.text(WIDTH / 2, 190, rank, {
-      fontSize: '120px', color: rankColors[rank], fontFamily: 'sans-serif', fontStyle: 'bold',
+    this.add.text(WIDTH / 2, 170, rank, {
+      fontSize: '110px', color: rankColors[rank], fontFamily: 'sans-serif', fontStyle: 'bold',
     }).setOrigin(0.5);
 
-    this.add.text(WIDTH / 2, 300, RANK_COMMENT[rank], {
+    this.add.text(WIDTH / 2, 270, RANK_COMMENT[rank], {
       fontSize: '20px', color: '#ffffff', fontFamily: 'sans-serif',
     }).setOrigin(0.5);
 
     const lines = [
       `クリアタイム : ${this.elapsedSec.toFixed(1)} 秒`,
-      `正答数 : ${this.correctCount} / ${TOTAL_QUESTIONS}`,
+      `正答数 : ${this.correctCount} / ${this.totalQuestions}`,
       `不正解数 : ${this.missCount}`,
     ];
-    this.add.text(WIDTH / 2, 380, lines.join('\n'), {
+    this.add.text(WIDTH / 2, 350, lines.join('\n'), {
       fontSize: '24px', color: '#ffffff', fontFamily: 'sans-serif', align: 'center', lineSpacing: 12,
     }).setOrigin(0.5);
 
-    const restartBtn = this.add.text(WIDTH / 2, 500, 'もう一度プレイ(Enter / クリック)', {
+    const retryBtn = this.add.text(WIDTH / 2, 460, 'もう一度プレイ', {
       fontSize: '20px', color: '#1a140c', fontFamily: 'sans-serif', fontStyle: 'bold',
       backgroundColor: '#f2cc5b', padding: { x: 20, y: 12 },
     }).setOrigin(0.5).setInteractive({ useHandCursor: true });
 
-    const restart = () => this.scene.start('MainScene');
-    restartBtn.on('pointerdown', restart);
-    this.input.keyboard.once('keydown-ENTER', restart);
+    const titleBtn = this.add.text(WIDTH / 2, 520, 'スタート画面にもどる', {
+      fontSize: '18px', color: '#ffffff', fontFamily: 'sans-serif', fontStyle: 'bold',
+      backgroundColor: '#3a2a1c', padding: { x: 18, y: 10 },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+
+    retryBtn.on('pointerdown', () => this.scene.start('MainScene'));
+    titleBtn.on('pointerdown', () => this.scene.start('TitleScene'));
+    this.input.keyboard.once('keydown-ENTER', () => this.scene.start('MainScene'));
+    this.input.keyboard.once('keydown-ESC', () => this.scene.start('TitleScene'));
   }
 }
 
@@ -398,7 +573,7 @@ const config = {
   height: HEIGHT,
   parent: 'game-container',
   backgroundColor: '#1a140c',
-  scene: [MainScene, ResultScene],
+  scene: [TitleScene, SettingsScene, MainScene, ResultScene],
 };
 
 new Phaser.Game(config);
