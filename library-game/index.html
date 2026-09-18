@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>としょかんクイズ - NDCタイムアタック</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #222;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    font-family: "Hiragino Maru Gothic ProN", "Yu Gothic", sans-serif;
+  }
+  #game-container {
+    box-shadow: 0 0 30px rgba(0,0,0,0.6);
+  }
+</style>
+</head>
+<body>
+<div id="game-container"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.70.0/phaser.min.js"></script>
+<script>
+/* =========================================================
+   としょかんクイズ - NDC(日本十進分類法)タイムアタック
+   数字キー0〜9とNDCジャンルを一致させて、10問を早く・正確に解く。
+   ========================================================= */
+
+const WIDTH = 800;
+const HEIGHT = 600;
+
+// NDC 0〜9 とジャンル名の対応
+const NDC_GENRES = [
+  { key: 0, name: '総記' },
+  { key: 1, name: '哲学' },
+  { key: 2, name: '歴史' },
+  { key: 3, name: '社会科学' },
+  { key: 4, name: '自然科学' },
+  { key: 5, name: '技術' },
+  { key: 6, name: '産業' },
+  { key: 7, name: '芸術' },
+  { key: 8, name: '言語' },
+  { key: 9, name: '文学' },
+];
+
+const TOTAL_QUESTIONS = 10;
+
+// ---------- 効果音(Web Audio APIで都度合成、外部ファイル不要) ----------
+class SoundFX {
+  constructor() {
+    this.ctx = null;
+  }
+  ensureCtx() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC();
+    }
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+    return this.ctx;
+  }
+  playCorrect() {
+    const ctx = this.ensureCtx();
+    const now = ctx.currentTime;
+    [523.25, 659.25, 783.99].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + i * 0.07);
+      gain.gain.exponentialRampToValueAtTime(0.25, now + i * 0.07 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.07 + 0.18);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now + i * 0.07);
+      osc.stop(now + i * 0.07 + 0.2);
+    });
+  }
+  playWrong() {
+    const ctx = this.ensureCtx();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(180, now);
+    osc.frequency.exponentialRampToValueAtTime(90, now + 0.25);
+    gain.gain.setValueAtTime(0.2, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.3);
+  }
+  playClear() {
+    const ctx = this.ensureCtx();
+    const now = ctx.currentTime;
+    [523.25, 659.25, 783.99, 1046.5].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + i * 0.12);
+      gain.gain.exponentialRampToValueAtTime(0.3, now + i * 0.12 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.12 + 0.3);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now + i * 0.12);
+      osc.stop(now + i * 0.12 + 0.32);
+    });
+  }
+}
+const sfx = new SoundFX();
+
+// ---------- 評価ランク計算 ----------
+// 正答数を最優先(基本ランクの上限を決める)、その範囲内でタイムを加味する。
+// 「遅くても全問正解ならある程度評価は良い／速くても不正解が多いと評価は下がる」を満たす設計。
+function calcRank(correctCount, missCount, elapsedSec) {
+  // 正答数ベースの基本評価と、そのランク内で出せる最高ランク
+  let baseRank;
+  if (correctCount === 10 && missCount === 0) baseRank = 'S';
+  else if (correctCount >= 9) baseRank = 'A';
+  else if (correctCount >= 7) baseRank = 'B';
+  else if (correctCount >= 5) baseRank = 'C';
+  else baseRank = 'D';
+
+  // タイムによる補正順位（速いほど良いが、正答数の壁は超えられない）
+  const rankOrder = ['D', 'C', 'B', 'A', 'S'];
+  let timeRank;
+  if (elapsedSec <= 20) timeRank = 'S';
+  else if (elapsedSec <= 35) timeRank = 'A';
+  else if (elapsedSec <= 55) timeRank = 'B';
+  else if (elapsedSec <= 80) timeRank = 'C';
+  else timeRank = 'D';
+
+  const baseIdx = rankOrder.indexOf(baseRank);
+  const timeIdx = rankOrder.indexOf(timeRank);
+  // 最終ランクは基本ランクを上限として、タイムランクとの min を取る
+  const finalIdx = Math.min(baseIdx, timeIdx);
+  // ただし全問正解(ノーミス)の場合だけは基本ランクSを保証しつつ、タイムが極端に遅い場合はAまで許容
+  if (correctCount === 10 && missCount === 0) {
+    return finalIdx >= rankOrder.indexOf('A') ? rankOrder[finalIdx] : 'A';
+  }
+  return rankOrder[finalIdx];
+}
+
+const RANK_COMMENT = {
+  S: 'かんぺき！司書レベルです',
+  A: 'とても優秀です！',
+  B: 'なかなかの腕前です',
+  C: 'まずまず。復習してみよう',
+  D: 'NDCをもう一度確認しよう',
+};
+
+// ============================================================
+// メインシーン
+// ============================================================
+class MainScene extends Phaser.Scene {
+  constructor() {
+    super('MainScene');
+  }
+
+  preload() {
+    this.load.image('bg', 'assets/library-bg.png');
+    this.load.image('character', 'assets/character.png');
+  }
+
+  create() {
+    // ---- 背景 ----
+    this.add.image(WIDTH / 2, HEIGHT / 2, 'bg').setDisplaySize(WIDTH, HEIGHT);
+
+    // ---- 読みやすさ確保用の半透明パネル(左:キャラ側、右:お題側) ----
+    this.add.rectangle(150, 360, 280, 400, 0x000000, 0.25).setOrigin(0.5);
+    this.rightPanel = this.add.rectangle(600, 210, 380, 300, 0x1a1408, 0.55).setOrigin(0.5).setStrokeStyle(3, 0x3a2a1c);
+
+    // ---- キャラクター(左側、床に立つ位置) ----
+    this.character = this.add.image(150, 350, 'character');
+    this.character.setScale(0.42);
+    this.charBaseScale = 0.42;
+    this.charBaseX = 150;
+    this.charBaseY = 350;
+
+    // ---- キー対応表を左下に小さく常時表示(覚え始めのヒント) ----
+    const guideLines = NDC_GENRES.map(g => `${g.key} : ${g.name}`);
+    this.add.text(20, 20, guideLines.slice(0, 5).join('\n'), {
+      fontSize: '15px', color: '#fff8e7', fontFamily: 'sans-serif', lineSpacing: 6,
+      backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 8, y: 6 },
+    });
+    this.add.text(130, 20, guideLines.slice(5, 10).join('\n'), {
+      fontSize: '15px', color: '#fff8e7', fontFamily: 'sans-serif', lineSpacing: 6,
+      backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 8, y: 6 },
+    });
+
+    // ---- お題エリア(右側) ----
+    this.add.text(600, 90, 'このジャンルは\nNDCで何番？', {
+      fontSize: '20px', color: '#f2cc5b', fontFamily: 'sans-serif', align: 'center', lineSpacing: 6,
+    }).setOrigin(0.5);
+
+    this.questionText = this.add.text(600, 180, '', {
+      fontSize: '46px', color: '#ffffff', fontFamily: 'sans-serif', fontStyle: 'bold', align: 'center',
+    }).setOrigin(0.5);
+
+    // 進捗・スコア表示
+    this.progressText = this.add.text(600, 260, '', {
+      fontSize: '18px', color: '#dddddd', fontFamily: 'sans-serif', align: 'center',
+    }).setOrigin(0.5);
+
+    // 正誤アイコン(演出用、通常は非表示)
+    this.resultIcon = this.add.text(600, 320, '', {
+      fontSize: '64px', fontFamily: 'sans-serif', fontStyle: 'bold',
+    }).setOrigin(0.5).setAlpha(0);
+
+    // タイマー表示(左上)
+    this.timerText = this.add.text(WIDTH - 20, 20, '0.0秒', {
+      fontSize: '22px', color: '#ffffff', fontFamily: 'sans-serif', fontStyle: 'bold',
+      backgroundColor: 'rgba(20,15,8,0.55)', padding: { x: 10, y: 6 },
+    }).setOrigin(1, 0);
+
+    // 画面全体フラッシュ用オーバーレイ
+    this.flashOverlay = this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0xffffff, 0).setDepth(100);
+
+    // ---- ゲーム状態 ----
+    this.order = Phaser.Utils.Array.Shuffle(NDC_GENRES.slice()); // 10ジャンルをランダム順で1回ずつ出題
+    this.qIndex = 0;
+    this.correctCount = 0;
+    this.missCount = 0;
+    this.startTime = 0;
+    this.elapsed = 0;
+    this.locked = false;      // 演出中の入力ロック
+    this.answeredThisQ = false; // このお題で既に不正解を記録したか(無思考連打対策)
+    this.finished = false;
+
+    this.startTime = this.time.now;
+    this.showQuestion();
+
+    // ---- キーボード入力 ----
+    this.input.keyboard.on('keydown', (event) => this.handleKey(event));
+  }
+
+  update() {
+    if (this.finished) return;
+    this.elapsed = (this.time.now - this.startTime) / 1000;
+    this.timerText.setText(this.elapsed.toFixed(1) + '秒');
+  }
+
+  showQuestion() {
+    if (this.qIndex >= TOTAL_QUESTIONS) {
+      this.finishGame();
+      return;
+    }
+    this.currentGenre = this.order[this.qIndex];
+    this.questionText.setText(this.currentGenre.name);
+    this.progressText.setText(`第 ${this.qIndex + 1} / ${TOTAL_QUESTIONS} 問`);
+    this.answeredThisQ = false;
+  }
+
+  handleKey(event) {
+    if (this.finished || this.locked) return;
+    if (!/^[0-9]$/.test(event.key)) return; // 数字キー以外は無視
+
+    const pressed = parseInt(event.key, 10);
+
+    if (pressed === this.currentGenre.key) {
+      // ---- 正解 ----
+      this.correctCount++;
+      sfx.playCorrect();
+      this.reactCorrect();
+    } else {
+      // ---- 不正解 ----
+      // 無思考連打防止: 1問につき不正解カウントは1回だけ(何度違うキーを押しても増えない)
+      if (!this.answeredThisQ) {
+        this.missCount++;
+        this.answeredThisQ = true;
+      }
+      sfx.playWrong();
+      this.reactWrong();
+    }
+  }
+
+  reactCorrect() {
+    this.locked = true;
+    this.resultIcon.setText('◯').setColor('#5fd97a').setAlpha(1).setScale(0.5);
+    this.tweens.add({ targets: this.resultIcon, scale: 1, alpha: { from: 1, to: 0 }, duration: 500, ease: 'Cubic.easeOut' });
+
+    this.flashOverlay.fillColor = 0x5fd97a;
+    this.tweens.add({ targets: this.flashOverlay, alpha: { from: 0.35, to: 0 }, duration: 300 });
+
+    // キャラクターが軽くジャンプして喜ぶ演出
+    this.tweens.add({
+      targets: this.character,
+      y: this.charBaseY - 30,
+      scale: this.charBaseScale * 1.08,
+      duration: 160,
+      yoyo: true,
+      ease: 'Quad.easeOut',
+      onComplete: () => {
+        this.qIndex++;
+        this.locked = false;
+        this.showQuestion();
+      },
+    });
+  }
+
+  reactWrong() {
+    this.locked = true;
+    this.resultIcon.setText('×').setColor('#ff6b6b').setAlpha(1).setScale(0.5);
+    this.tweens.add({ targets: this.resultIcon, scale: 1, alpha: { from: 1, to: 0 }, duration: 450, ease: 'Cubic.easeOut' });
+
+    this.flashOverlay.fillColor = 0xff4d4d;
+    this.tweens.add({ targets: this.flashOverlay, alpha: { from: 0.3, to: 0 }, duration: 250 });
+
+    // キャラクターが首を振って残念がる演出(次の問題には進まない=このメソッドは待たない)
+    const baseX = this.charBaseX;
+    this.tweens.add({
+      targets: this.character,
+      x: baseX - 12,
+      duration: 60,
+      yoyo: true,
+      repeat: 3,
+      ease: 'Sine.easeInOut',
+      onComplete: () => {
+        this.character.x = baseX;
+        this.locked = false;
+      },
+    });
+  }
+
+  finishGame() {
+    this.finished = true;
+    const finalElapsed = this.elapsed;
+    sfx.playClear();
+    this.scene.start('ResultScene', {
+      correctCount: this.correctCount,
+      missCount: this.missCount,
+      elapsedSec: finalElapsed,
+    });
+  }
+}
+
+// ============================================================
+// リザルトシーン
+// ============================================================
+class ResultScene extends Phaser.Scene {
+  constructor() {
+    super('ResultScene');
+  }
+
+  init(data) {
+    this.correctCount = data.correctCount;
+    this.missCount = data.missCount;
+    this.elapsedSec = data.elapsedSec;
+  }
+
+  create() {
+    this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x1a140c, 1);
+
+    this.add.text(WIDTH / 2, 70, 'クリア！', {
+      fontSize: '44px', color: '#f2cc5b', fontFamily: 'sans-serif', fontStyle: 'bold',
+    }).setOrigin(0.5);
+
+    const rank = calcRank(this.correctCount, this.missCount, this.elapsedSec);
+    const rankColors = { S: '#ffd23f', A: '#5fd97a', B: '#5fa8d3', C: '#f4a261', D: '#ff6b6b' };
+
+    this.add.text(WIDTH / 2, 190, rank, {
+      fontSize: '120px', color: rankColors[rank], fontFamily: 'sans-serif', fontStyle: 'bold',
+    }).setOrigin(0.5);
+
+    this.add.text(WIDTH / 2, 300, RANK_COMMENT[rank], {
+      fontSize: '20px', color: '#ffffff', fontFamily: 'sans-serif',
+    }).setOrigin(0.5);
+
+    const lines = [
+      `クリアタイム : ${this.elapsedSec.toFixed(1)} 秒`,
+      `正答数 : ${this.correctCount} / ${TOTAL_QUESTIONS}`,
+      `不正解数 : ${this.missCount}`,
+    ];
+    this.add.text(WIDTH / 2, 380, lines.join('\n'), {
+      fontSize: '24px', color: '#ffffff', fontFamily: 'sans-serif', align: 'center', lineSpacing: 12,
+    }).setOrigin(0.5);
+
+    const restartBtn = this.add.text(WIDTH / 2, 500, 'もう一度プレイ(Enter / クリック)', {
+      fontSize: '20px', color: '#1a140c', fontFamily: 'sans-serif', fontStyle: 'bold',
+      backgroundColor: '#f2cc5b', padding: { x: 20, y: 12 },
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+
+    const restart = () => this.scene.start('MainScene');
+    restartBtn.on('pointerdown', restart);
+    this.input.keyboard.once('keydown-ENTER', restart);
+  }
+}
+
+// ============================================================
+// ゲーム設定・起動
+// ============================================================
+const config = {
+  type: Phaser.AUTO,
+  width: WIDTH,
+  height: HEIGHT,
+  parent: 'game-container',
+  backgroundColor: '#1a140c',
+  scene: [MainScene, ResultScene],
+};
+
+new Phaser.Game(config);
+</script>
+</body>
+</html>
